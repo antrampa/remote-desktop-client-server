@@ -1,0 +1,6 @@
+To compile
+javac Server.java Client.java ClientGUI.java 
+
+To run
+java Server 
+java ClientGUI
