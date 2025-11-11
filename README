@@ -2,5 +2,5 @@ To compile
 javac Server.java Client.java ClientGUI.java ServerGUI.java
 
 To run
-java Server 
+java ServerGUI 
 java ClientGUI
