@@ -5,12 +5,13 @@ import java.awt.event.*;
 import java.awt.image.BufferedImage;
 import java.io.*;
 import java.net.Socket;
+import java.util.List;
 
 /**
- * Simple Remote Desktop Client with GUI.
- * - Enter server IP and port
- * - Click Connect to start receiving frames
- * - Click Disconnect to stop
+ * Remote Desktop Client with GUI and remote control
+ * - Connect/disconnect via GUI
+ * - Displays live screen stream
+ * - Sends mouse + keyboard events to server
  */
 public class ClientGUI extends JFrame {
     private final JTextField ipField = new JTextField("127.0.0.1", 15);
@@ -19,15 +20,19 @@ public class ClientGUI extends JFrame {
     private final JLabel imageLabel = new JLabel();
     private final JPanel topPanel = new JPanel(new FlowLayout(FlowLayout.LEFT));
 
-    // Networking fields
+    // Networking
     private volatile Socket socket;
     private volatile DataInputStream dis;
+    private volatile DataOutputStream dos;
     private ImageReceiverWorker receiverWorker;
 
-    public ClientGUI() {
-        super("Remote Desktop Viewer - Client");
+    // Screen size of remote machine (assumed same as local for now)
+    private Dimension remoteScreenSize = Toolkit.getDefaultToolkit().getScreenSize();
 
-        // Top controls
+    public ClientGUI() {
+        super("Remote Desktop Viewer (Client)");
+
+        // Build GUI
         topPanel.add(new JLabel("Server IP:"));
         topPanel.add(ipField);
         topPanel.add(new JLabel("Port:"));
@@ -39,7 +44,6 @@ public class ClientGUI extends JFrame {
         imageLabel.setBackground(Color.BLACK);
         imageLabel.setOpaque(true);
 
-        // Layout
         this.setLayout(new BorderLayout());
         this.add(topPanel, BorderLayout.NORTH);
         this.add(new JScrollPane(imageLabel), BorderLayout.CENTER);
@@ -48,7 +52,7 @@ public class ClientGUI extends JFrame {
         this.setSize(1000, 700);
         this.setLocationRelativeTo(null);
 
-        // Button action
+        // Connect button
         connectButton.addActionListener(e -> {
             if (receiverWorker == null || receiverWorker.isDone()) {
                 startConnection();
@@ -56,6 +60,9 @@ public class ClientGUI extends JFrame {
                 stopConnection();
             }
         });
+
+        // Send mouse and keyboard events
+        setupEventListeners();
 
         // Graceful shutdown
         this.addWindowListener(new WindowAdapter() {
@@ -84,20 +91,107 @@ public class ClientGUI extends JFrame {
     private void stopConnection() {
         connectButton.setEnabled(false);
         connectButton.setText("Disconnecting...");
-        // Close resources and cancel worker
         try {
             if (receiverWorker != null) receiverWorker.cancel(true);
             if (dis != null) dis.close();
+            if (dos != null) dos.close();
             if (socket != null) socket.close();
         } catch (IOException ignored) {
         } finally {
             socket = null;
             dis = null;
+            dos = null;
             SwingUtilities.invokeLater(() -> {
                 connectButton.setText("Connect");
                 connectButton.setEnabled(true);
             });
         }
+    }
+
+    private void setupEventListeners() {
+        imageLabel.addMouseMotionListener(new MouseMotionAdapter() {
+            @Override
+            public void mouseMoved(MouseEvent e) {
+                sendMouseMove(e.getX(), e.getY());
+            }
+            @Override
+            public void mouseDragged(MouseEvent e) {
+                sendMouseMove(e.getX(), e.getY());
+            }
+        });
+
+        imageLabel.addMouseListener(new MouseAdapter() {
+            @Override
+            public void mousePressed(MouseEvent e) {
+                sendMouseClick(e);
+            }
+        });
+
+        imageLabel.setFocusable(true);
+        imageLabel.addKeyListener(new KeyAdapter() {
+            @Override
+            public void keyPressed(KeyEvent e) {
+                sendKeyEvent(3, e.getKeyCode()); // 3 = key press
+            }
+            @Override
+            public void keyReleased(KeyEvent e) {
+                sendKeyEvent(4, e.getKeyCode()); // 4 = key release
+            }
+        });
+    }
+
+    private void sendMouseMove(int x, int y) {
+        if (dos == null) return;
+
+        try {
+            // Convert local imageLabel coordinates to remote screen coordinates
+            int lblW = imageLabel.getWidth();
+            int lblH = imageLabel.getHeight();
+            double scaleX = remoteScreenSize.getWidth() / lblW;
+            double scaleY = remoteScreenSize.getHeight() / lblH;
+            int remoteX = (int) (x * scaleX);
+            int remoteY = (int) (y * scaleY);
+
+            synchronized (dos) {
+                dos.writeByte(1); // event type = mouse move
+                dos.writeInt(remoteX);
+                dos.writeInt(remoteY);
+                dos.flush();
+            }
+        } catch (IOException ignored) {}
+    }
+
+    private void sendMouseClick(MouseEvent e) {
+        if (dos == null) return;
+
+        int button;
+        if (e.getButton() == MouseEvent.BUTTON1)
+            button = 1;
+        else if (e.getButton() == MouseEvent.BUTTON3)
+            button = 2;
+        else
+            button = 1;
+
+        try {
+            synchronized (dos) {
+                dos.writeByte(2); // event type = mouse click
+                dos.writeInt(button);
+                dos.flush();
+            }
+        } catch (IOException ignored) {}
+    }
+
+
+    private void sendKeyEvent(int type, int keyCode) {
+        if (dos == null) return;
+
+        try {
+            synchronized (dos) {
+                dos.writeByte(type); // 3 = key press, 4 = key release
+                dos.writeInt(keyCode);
+                dos.flush();
+            }
+        } catch (IOException ignored) {}
     }
 
     private class ImageReceiverWorker extends SwingWorker<Void, BufferedImage> {
@@ -114,27 +208,27 @@ public class ClientGUI extends JFrame {
             try {
                 socket = new Socket(host, port);
                 dis = new DataInputStream(new BufferedInputStream(socket.getInputStream()));
+                dos = new DataOutputStream(new BufferedOutputStream(socket.getOutputStream()));
+
                 SwingUtilities.invokeLater(() -> {
                     connectButton.setText("Disconnect");
                     connectButton.setEnabled(true);
+                    imageLabel.requestFocusInWindow(); // capture keyboard
                 });
 
                 while (!isCancelled()) {
-                    // Protocol: first an int length, then the bytes
                     int len;
                     try {
                         len = dis.readInt();
                     } catch (EOFException eof) {
-                        break; // server closed
+                        break;
                     }
 
                     if (len <= 0) continue;
-                    byte[] bytes = new byte[len];
-                    dis.readFully(bytes);
+                    byte[] data = new byte[len];
+                    dis.readFully(data);
 
-                    // Decode image
-                    ByteArrayInputStream bais = new ByteArrayInputStream(bytes);
-                    BufferedImage img = ImageIO.read(bais);
+                    BufferedImage img = ImageIO.read(new ByteArrayInputStream(data));
                     if (img != null) publish(img);
                 }
             } catch (IOException ex) {
@@ -143,44 +237,28 @@ public class ClientGUI extends JFrame {
                             "Connection error: " + ex.getMessage(), "Error", JOptionPane.ERROR_MESSAGE));
                 }
             } finally {
-                // cleanup when finished
-                try {
-                    if (dis != null) dis.close();
-                    if (socket != null) socket.close();
-                } catch (IOException ignored) {}
+                stopConnection();
             }
             return null;
         }
 
         @Override
-        protected void process(java.util.List<BufferedImage> chunks) {
-            // process latest image only (drop older frames if backlog)
+        protected void process(List<BufferedImage> chunks) {
             BufferedImage latest = chunks.get(chunks.size() - 1);
-            // Scale image to fit label while preserving aspect ratio
             int lblW = imageLabel.getWidth();
             int lblH = imageLabel.getHeight();
             if (lblW <= 0 || lblH <= 0) {
-                // If label not laid out yet, just set directly
                 imageLabel.setIcon(new ImageIcon(latest));
             } else {
                 Image scaled = getScaledImage(latest, lblW, lblH);
                 imageLabel.setIcon(new ImageIcon(scaled));
             }
         }
-
-        @Override
-        protected void done() {
-            SwingUtilities.invokeLater(() -> {
-                connectButton.setText("Connect");
-                connectButton.setEnabled(true);
-            });
-        }
     }
 
     private static Image getScaledImage(BufferedImage srcImg, int maxW, int maxH) {
         double imgW = srcImg.getWidth();
         double imgH = srcImg.getHeight();
-
         double scale = Math.min((double) maxW / imgW, (double) maxH / imgH);
         if (scale <= 0) scale = 1.0;
 
