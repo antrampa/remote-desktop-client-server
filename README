@@ -1,5 +1,5 @@
 To compile
-javac Server.java Client.java ClientGUI.java 
+javac Server.java Client.java ClientGUI.java ServerGUI.java
 
 To run
 java Server 
